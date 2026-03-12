@@ -66,8 +66,9 @@ class BidirectionalGating(nn.Module):
 
         # 哈达玛积（逐元素乘）：门控特征加权融合
         # 正向：VIS 特征被 IR 热力图"筛选"——无热量的冗余区域被抑制
-        # 反向：IR 特征被 VIS 边缘结构"约束"——泛光区域被压制
-        fused = feat_vis * gate_for_vis + feat_ir * gate_for_ir
+        # 反向：IR 特征被 VIS 边缘结构约束。为防止空间门控值的剧烈波动将实心红外物体“切割/碎片化”，
+        # 我们引入了残差连接 (feat_ir + ...)，保证红外的基础热量块绝对不流失，门控仅做能量增益。
+        fused = feat_vis * gate_for_vis + feat_ir + feat_ir * gate_for_ir
 
         return fused
 
