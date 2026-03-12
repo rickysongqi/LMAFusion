@@ -82,9 +82,11 @@ def infer_single(model, ir_t: torch.Tensor, vis_t: torch.Tensor, device, vis_col
         y, cr, cb = cv2.split(vis_ycrcb)
         
         # 优化色彩渗透：基于可见光亮度的自适应 Alpha 混合
-        # 防止融合输出的 Y 过高（接近255）导致 CbCr 色彩被强制丢弃变为死白
-        alpha = 0.6
-        fused_mixed = cv2.addWeighted(fused_gray_uint8, alpha, y, 1 - alpha, 0)
+        # 用户希望红外再亮一点，在此调高 Alpha 权重 (0.6 -> 0.75) 把更多的明度控制权交还给红外
+        # 并且对融合灰度图做微小的亮度提拉 (1.1x)
+        alpha = 0.75
+        fused_gray_boosted = np.clip(fused_gray_uint8 * 1.1, 0, 255).astype(np.uint8)
+        fused_mixed = cv2.addWeighted(fused_gray_boosted, alpha, y, 1 - alpha, 0)
         
         fused_ycrcb = cv2.merge([fused_mixed, cr, cb])
         # YCrCb -> BGR
@@ -101,35 +103,18 @@ def save_gray(path: str, arr):
     tio.write_png(t, path)
 
 
-def main(opts):
-    device = torch.device(f"cuda:{opts.gpu_id}" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
-
-    # 加载权重 (网络存在层数或形状变更时智能加载)
-    model = LMAFusion(base_ch=opts.base_ch, d_state=opts.d_state).to(device)
-    try:
-        ckpt = torch.load(opts.model_path, map_location=device)
-        if 'model' in ckpt:
-            pretrained_dict = ckpt['model']
-        else:
-            pretrained_dict = ckpt
-            
-        model_dict = model.state_dict()
-        
-        # 筛选出键名相同且形状完全一致的权重
-        valid_dict = {
-            k: v for k, v in pretrained_dict.items() 
-            if k in model_dict and v.shape == model_dict[k].shape
-        }
-        
-        model_dict.update(valid_dict)
-        model.load_state_dict(model_dict)
-        print(f"Model loaded: {model_path}")
-    except Exception as e:
-        print(f"Error loading model weights: {e}")
-        return None
-    model.eval()
-    return model
+def load_gray_tensor(path: str) -> torch.Tensor:
+    """读取图像为灰度 tensor [1, 1, H, W]，值域 [0, 1]"""
+    img = tio.read_image(str(path))         # [C, H, W], uint8
+    if img.shape[0] == 3:
+        # RGB → 灰度: 0.299R + 0.587G + 0.114B
+        img = (0.299 * img[0] + 0.587 * img[1] + 0.114 * img[2]).unsqueeze(0)
+    elif img.shape[0] >= 4:
+        img = img[:3]
+        img = (0.299 * img[0] + 0.587 * img[1] + 0.114 * img[2]).unsqueeze(0)
+    else:
+        img = img[0:1]
+    return img.float() / 255.0
 
 
 def main(opts):
@@ -138,7 +123,7 @@ def main(opts):
     print(f"Device: {device}")
 
     # 加载模型
-    model = LMAFusion(base_ch=opts.base_ch, d_state=opts.d_state).to(device)
+    model = LMAFusion(base_ch=opts.base_ch, d_state=opts.d_state, use_align=opts.use_align).to(device)
     try:
         ckpt = torch.load(opts.model_path, map_location=device)
         if 'model' in ckpt:
@@ -164,7 +149,6 @@ def main(opts):
     out_dir.mkdir(parents=True, exist_ok=True)
 
     ir_paths = sorted(list(Path(opts.ir_dir).glob('*.png'))) + sorted(list(Path(opts.ir_dir).glob('*.jpg')))
-    
     total = 0
     print("Start inference...")
     for p_ir in ir_paths:
@@ -220,6 +204,7 @@ def parse_opt():
     parser.add_argument('--d_state', type=int, default=16)
     parser.add_argument('--gpu_id', type=int, default=0)
     parser.add_argument('--color', action='store_true', help='开启色彩融合重映射')
+    parser.add_argument('--use_align', action='store_true', help='开启DCN形变对齐（若数据集已严格对齐如MSRS请勿开启）')
     return parser.parse_args()
 
 

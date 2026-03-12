@@ -4,8 +4,8 @@
 损失 = λ1 * L_intensity + λ2 * L_ssim + λ3 * L_gradient + λ4 * L_tv
 
 各项含义:
-  L_intensity : 强度保留（保证融合图亮度不低于 IR 和 VIS 的逐像素最大值）
-  L_ssim      : 结构相似性（与可见光图像保持视觉结构一致）
+  L_intensity : 强度保留（保证融合图亮度不低于 IR 和 VIS 的逐像素最大值）+ 红外显著区域增强
+  L_ssim      : 结构相似性（与红外和可见光图像保持视觉结构一致，红外权重更高）
   L_gradient  : 梯度保留（同时保留 IR 和 VIS 的边缘细节）
   L_tv        : 对齐平滑（对DCN偏移场施加总变分正则，防止跳跃伪影）
 """
@@ -20,7 +20,6 @@ class VGGPerceptualLoss(torch.nn.Module):
     def __init__(self, resize=True):
         super(VGGPerceptualLoss, self).__init__()
         blocks = []
-        # Load VGG16 features
         vgg = models.vgg16(weights=models.VGG16_Weights.DEFAULT).features
         blocks.append(vgg[:4].eval())
         blocks.append(vgg[4:9].eval())
@@ -35,41 +34,61 @@ class VGGPerceptualLoss(torch.nn.Module):
         self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
         self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
-    def forward(self, input, target):
-        if input.shape[1] != 3:
-            input = input.repeat(1, 3, 1, 1)
-            target = target.repeat(1, 3, 1, 1)
-        input = (input-self.mean) / self.std
-        target = (target-self.mean) / self.std
+    def _preprocess(self, img):
+        if img.shape[1] != 3:
+            img = img.repeat(1, 3, 1, 1)
+        img = (img - self.mean) / self.std
         if self.resize:
-            input = self.transform(input, mode='bilinear', size=(224, 224), align_corners=False)
-            target = self.transform(target, mode='bilinear', size=(224, 224), align_corners=False)
+            img = self.transform(img, mode='bilinear', size=(224, 224), align_corners=False)
+        return img
+
+    def _extract_features(self, img):
+        feats = []
+        x = img
+        for block in self.blocks:
+            x = block(x)
+            feats.append(x)
+        return feats
+
+    def forward(self, input, target):
+        x = self._preprocess(input)
+        y = self._preprocess(target)
         loss = 0.0
-        x = input
-        y = target
         for block in self.blocks:
             x = block(x)
             y = block(y)
             loss += F.mse_loss(x, y)
         return loss
 
+    def forward_symmetric(self, fused, ir, vis):
+        """对称感知损失：fused 特征只提取一次，分别与 IR 和 VIS 对比"""
+        f = self._extract_features(self._preprocess(fused))
+        f_ir = self._extract_features(self._preprocess(ir))
+        f_vis = self._extract_features(self._preprocess(vis))
+        loss_ir = sum(F.mse_loss(a, b) for a, b in zip(f, f_ir))
+        loss_vis = sum(F.mse_loss(a, b) for a, b in zip(f, f_vis))
+        return 0.5 * loss_ir + 0.5 * loss_vis
+
 # ──────────────────────────────────────────────────────────────
-# 1. 强度损失 (Intensity Loss)
+# 1. 强度损失 (Intensity Loss) — 含红外显著区域增强
 # ──────────────────────────────────────────────────────────────
 def intensity_loss(fused: torch.Tensor,
                    ir: torch.Tensor,
                    vis: torch.Tensor) -> torch.Tensor:
     """
-    强度保留损失。
+    强度保留损失（含红外显著区域增强约束）。
 
-    为了克服“虚影/鬼影”问题，且同时防止以前的突变色块：
-    采用 max(ir, vis) 提取最亮的目标边界，并仅进行 3×3 的轻量级平滑，
-    在保证边缘锐利（无虚影）的同时，强制红外热源在空间上连续（无碎斑）。
+    基础目标: max(ir, vis) 保证融合图亮度不低于两路最大值。
+    红外增强: 对红外显著区域（IR 比 VIS 亮的像素）施加额外 L1 惩罚，
+              确保红外热目标在融合图中被充分保留。
     """
     target = torch.max(ir, vis)
-    target_smooth = F.avg_pool2d(target, kernel_size=3, stride=1, padding=1)
-    
-    return F.l1_loss(fused, target_smooth)
+    L_base = F.l1_loss(fused, target)
+
+    ir_salient_mask = (ir > vis).float()
+    L_ir_preserve = (torch.abs(fused - ir) * ir_salient_mask).sum() / (ir_salient_mask.sum() + 1e-6)
+
+    return L_base + 0.5 * L_ir_preserve
 
 
 # ──────────────────────────────────────────────────────────────
@@ -188,6 +207,32 @@ def ncc_loss(aligned_ir: torch.Tensor,
 
 
 # ──────────────────────────────────────────────────────────────
+# 4b. 边缘域 NCC 对齐损失（跨模态更鲁棒）
+# ──────────────────────────────────────────────────────────────
+def edge_ncc_loss(aligned_ir: torch.Tensor,
+                  vis: torch.Tensor,
+                  window_size: int = 9) -> torch.Tensor:
+    """
+    在 Sobel 边缘域上计算 NCC，比原始像素域更适合跨模态对齐。
+
+    IR 和 VIS 的原始像素分布差异巨大（热图 vs 亮度图），
+    但两者的边缘/轮廓在空间上是同构的。先提取边缘再算 NCC，
+    可以获得更稳定的对齐梯度信号。
+    """
+    def sobel_edges(x):
+        sx = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
+                          dtype=x.dtype, device=x.device).reshape(1, 1, 3, 3)
+        sy = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
+                          dtype=x.dtype, device=x.device).reshape(1, 1, 3, 3)
+        return torch.sqrt(F.conv2d(x, sx, padding=1)**2 +
+                          F.conv2d(x, sy, padding=1)**2 + 1e-8)
+
+    edge_ir = sobel_edges(aligned_ir)
+    edge_vis = sobel_edges(vis)
+    return ncc_loss(edge_ir, edge_vis, window_size)
+
+
+# ──────────────────────────────────────────────────────────────
 # 5. 总变分平滑损失（用于对齐偏移场正则化）
 # ──────────────────────────────────────────────────────────────
 def tv_loss(tensor: torch.Tensor) -> torch.Tensor:
@@ -216,14 +261,20 @@ def fusion_loss(
     lambda_int: float = 1.0,
     lambda_ssim: float = 1.0,
     lambda_grad: float = 0.5,
-    lambda_tv: float = 0.0,    
+    lambda_tv: float = 0.0,
     offset: torch.Tensor = None,
     lambda_align: float = 5.0,
     vgg_loss: torch.nn.Module = None,
     lambda_perceptual: float = 1.0,
+    use_align: bool = False,
 ) -> tuple:
     """
     复合融合损失函数。
+
+    修复：
+    1. 感知损失改为对称（同时约束 IR 和 VIS），避免只拟合可见光外观
+    2. SSIM 对红外加权更高（0.6 IR + 0.4 VIS），防止红外结构丢失
+    3. 关闭对齐时跳过 NCC 损失（此时为常数，对梯度无贡献）
     """
     def sobel_gradient(x: torch.Tensor) -> torch.Tensor:
         sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
@@ -234,31 +285,37 @@ def fusion_loss(
         gy = F.conv2d(x, sobel_y, padding=1)
         return torch.sqrt(gx ** 2 + gy ** 2 + 1e-8)
 
-    # 1. 常规融合损失
+    # 1. 强度损失（含红外显著区域增强）
     L_int = intensity_loss(fused, aligned_ir, vis)
+
+    # 2. SSIM 损失：红外权重 0.6，可见光 0.4（红外结构更容易丢失）
     L_ssim_ir = ssim_loss(fused, aligned_ir)
     L_ssim_vis = ssim_loss(fused, vis)
-    L_ssim = (L_ssim_ir + L_ssim_vis) / 2.0
-    
-    # 梯度保留损失
+    L_ssim = 0.6 * L_ssim_ir + 0.4 * L_ssim_vis
+
+    # 3. 梯度保留损失
     grad_fused = sobel_gradient(fused)
     grad_ir = sobel_gradient(aligned_ir)
     grad_vis = sobel_gradient(vis)
     grad_target = torch.max(grad_ir, grad_vis)
     L_grad = F.l1_loss(grad_fused, grad_target)
 
-    # 2. 跨模态自监督对齐损失（NCC）
-    L_align = ncc_loss(aligned_ir, vis)
+    total = lambda_int * L_int + lambda_ssim * L_ssim + lambda_grad * L_grad
 
-    total = lambda_int * L_int + lambda_ssim * L_ssim + lambda_grad * L_grad + lambda_align * L_align
+    # 4. 对齐损失：仅在开启 DCN 对齐时启用（关闭时是常数，无梯度贡献）
+    #    使用边缘域 NCC，对跨模态（IR-VIS）匹配更鲁棒
+    L_align = torch.tensor(0.0, device=fused.device)
+    if use_align:
+        L_align = edge_ncc_loss(aligned_ir, vis)
+        total = total + lambda_align * L_align
 
-    # 3. 感知损失 (Perceptual Loss)
+    # 5. 感知损失：对称约束（fused 特征只提取一次，分别与 IR/VIS 对比）
     L_perceptual = torch.tensor(0.0, device=fused.device)
     if vgg_loss is not None:
-        L_perceptual = vgg_loss(fused, vis)
+        L_perceptual = vgg_loss.forward_symmetric(fused, aligned_ir, vis)
         total = total + lambda_perceptual * L_perceptual
 
-    # 4. TV 平滑约束
+    # 6. TV 平滑约束
     L_tv = torch.tensor(0.0, device=fused.device)
     if lambda_tv > 0 and offset is not None:
         L_tv = tv_loss(offset)

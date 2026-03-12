@@ -87,9 +87,11 @@ class LMAFusion(nn.Module):
         d_state: int = 16,
         exchange_p: float = 0.5,
         align_mid_ch: int = 16,
+        use_align: bool = False,  # 默认 MSRS 等标准数据集已对齐，关闭重采样变形防止画蛇添足
     ):
         super().__init__()
         self.base_ch = base_ch
+        self.use_align = use_align
         shallow_out_ch = base_ch * 2  # 浅层编码后通道数
 
         # ── 模块1：DCN 形变对齐 ────────────────────────────────────
@@ -124,7 +126,13 @@ class LMAFusion(nn.Module):
             fused (Tensor): 融合图像 [B, 1, H, W]，值域 [0, 1]
         """
         # ── Step1: 形变对齐（IR 向 VIS 对齐） ──────────────────────
-        ir_aligned, vis_ref, offset = self.align(ir, vis)
+        if self.use_align:
+            ir_aligned, vis_ref, offset = self.align(ir, vis)
+        else:
+            # 针对已对齐标准数据集（如 MSRS），直接跳过变形采样，防止引入人为畸变偏移
+            ir_aligned = ir
+            vis_ref = vis
+            offset = torch.zeros(ir.shape[0], 2, ir.shape[2], ir.shape[3], device=ir.device)
 
         # 用于融合的对齐图
         ir_aligned_for_fusion = ir_aligned

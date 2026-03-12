@@ -69,6 +69,7 @@ def train_one_epoch(model, loader, optimizer, device, writer, epoch, opts, vgg_l
             offset=offset,
             vgg_loss=vgg_loss,
             lambda_perceptual=opts.lambda_perceptual,
+            use_align=opts.use_align,
         )
 
         optimizer.zero_grad()
@@ -122,6 +123,7 @@ def validate(model, loader, device, opts, vgg_loss=None):
                 offset=None,
                 vgg_loss=vgg_loss,
                 lambda_perceptual=opts.lambda_perceptual,
+                use_align=opts.use_align,
             )
             meter.update(total_loss.item())
     return meter.avg
@@ -148,6 +150,7 @@ def main(opts):
         base_ch=opts.base_ch,
         d_state=opts.d_state,
         exchange_p=opts.exchange_p,
+        use_align=opts.use_align,
     ).to(device)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"总参数量: {total_params:,} ({total_params / 1e3:.1f}K)")
@@ -232,6 +235,7 @@ def parse_opt():
     parser.add_argument('--model_path', type=str, default='./model', help='模型保存目录')
     parser.add_argument('--log_dir', type=str, default='./logs', help='TensorBoard 日志目录')
     parser.add_argument('--log_freq', type=int, default=20, help='打印频率（iteration）')
+    parser.add_argument('--use_align', action='store_true', help='开启DCN形变对齐（若数据集已严格对齐如MSRS请勿开启）')
 
     return parser.parse_args()
 
