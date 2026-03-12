@@ -16,9 +16,7 @@ import torch
 import torch.nn.functional as F
 
 from net import LMAFusion
-import torchvision.io as tio
 
-from net import LMAFusion
 
 
 def load_gray_tensor(path: str) -> torch.Tensor:
@@ -80,9 +78,15 @@ def infer_single(model, ir_t: torch.Tensor, vis_t: torch.Tensor, device, vis_col
         vis_bgr = cv2.resize(vis_color, (w, h), interpolation=cv2.INTER_LINEAR)
         # BGR -> YCrCb
         vis_ycrcb = cv2.cvtColor(vis_bgr, cv2.COLOR_BGR2YCrCb)
-        # 分离通道，用融合的高级纹理 Y_fusion 替换原图简单的亮度通道 Y
+        # 分离通道，获取原图的去色亮度通道 Y
         y, cr, cb = cv2.split(vis_ycrcb)
-        fused_ycrcb = cv2.merge([fused_gray_uint8, cr, cb])
+        
+        # 优化色彩渗透：基于可见光亮度的自适应 Alpha 混合
+        # 防止融合输出的 Y 过高（接近255）导致 CbCr 色彩被强制丢弃变为死白
+        alpha = 0.6
+        fused_mixed = cv2.addWeighted(fused_gray_uint8, alpha, y, 1 - alpha, 0)
+        
+        fused_ycrcb = cv2.merge([fused_mixed, cr, cb])
         # YCrCb -> BGR
         final_img = cv2.cvtColor(fused_ycrcb, cv2.COLOR_YCrCb2BGR)
         return final_img

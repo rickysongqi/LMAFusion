@@ -62,14 +62,13 @@ def intensity_loss(fused: torch.Tensor,
     """
     强度保留损失。
 
-    使用 max(IR, VIS) 作为亮度目标，同时对 target 做 3×3 均值平滑，
-    强制网络输出空间连续的热量分布（消除孤立亮斑），同时保留 IR 发光效果。
-
-    L_int = mean( |fused - smooth(max(ir, vis))| )
+    为了克服“虚影/鬼影”问题，且同时防止以前的突变色块：
+    采用 max(ir, vis) 提取最亮的目标边界，并仅进行 3×3 的轻量级平滑，
+    在保证边缘锐利（无虚影）的同时，强制红外热源在空间上连续（无碎斑）。
     """
     target = torch.max(ir, vis)
-    # 9×9 均值平滑：更宽的光晕过渡区域，消除 IR 热区与 VIS 背景之间的"割裂感"
-    target_smooth = F.avg_pool2d(target, kernel_size=9, stride=1, padding=4)
+    target_smooth = F.avg_pool2d(target, kernel_size=3, stride=1, padding=1)
+    
     return F.l1_loss(fused, target_smooth)
 
 
