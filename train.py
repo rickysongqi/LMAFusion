@@ -1,28 +1,27 @@
 """
-训练主脚本 — LMAFusion
+训练主脚本 — LMAFusion（含 AGM 自适应自引导）
 
 用法:
-  # 首次运行（准备数据集后）
+  # 基础训练
   python train.py --data_path ./data --epoch 50 --batch_size 8
+
+  # AGM 自引导训练（推荐）
+  python train.py --data_path ./data_csmr --epoch 50 --batch_size 8 --use_agm
 
   # 断点续训
   python train.py --data_path ./data --epoch 50 --is_resume ./model/best.pth
-
-数据准备（只需执行一次）:
-  from dataset import DroneDatasetPreparer
-  DroneDatasetPreparer.prepare(
-      ir_src  = r'C:/.../.../train_by_yolo_IR/images/train',
-      vis_src = r'C:/.../.../train_by_yolo_RGB/images/train',
-      output_dir = './data'
-  )
 """
 
 import argparse
 import datetime
 import os
 import time
+from pathlib import Path
 
+import cv2
+import numpy as np
 import torch
+from torch.autograd import Variable
 from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
@@ -31,7 +30,7 @@ try:
     _HAS_TB = True
 except ImportError:
     _HAS_TB = False
-    class SummaryWriter:  # dummy writer
+    class SummaryWriter:
         def __init__(self, *a, **kw): pass
         def add_scalar(self, *a, **kw): pass
         def close(self): pass
@@ -42,34 +41,119 @@ from net import LMAFusion
 from utils import save_model, load_model, AverageMeter, setup_logger
 
 
-def train_one_epoch(model, loader, optimizer, device, writer, epoch, opts, vgg_loss=None):
+# ── AGM 辅助函数 ──────────────────────────────────────────────
+
+def cc(ir: torch.Tensor, vis: torch.Tensor, fused: torch.Tensor) -> torch.Tensor:
+    """
+    Cross-Correlation 质量评估：衡量 fused 与 IR/VIS 的相关性均值。
+    值越高说明 fused 同时保留了 IR 和 VIS 的信息。
+    """
+    A = ir.squeeze()
+    B = vis.squeeze()
+    F = fused.squeeze()
+    batch = A.shape[0] if A.dim() == 3 else 1
+    if A.dim() == 2:
+        A, B, F = A.unsqueeze(0), B.unsqueeze(0), F.unsqueeze(0)
+
+    c = 0.0
+    for i in range(batch):
+        a, b, f = A[i] * 255, B[i] * 255, F[i] * 255
+        rAF = torch.sum((a - a.mean()) * (f - f.mean())) / (
+            torch.sqrt(torch.sum((a - a.mean()) ** 2) * torch.sum((f - f.mean()) ** 2)) + 1e-8)
+        rBF = torch.sum((b - b.mean()) * (f - f.mean())) / (
+            torch.sqrt(torch.sum((b - b.mean()) ** 2) * torch.sum((f - f.mean()) ** 2)) + 1e-8)
+        c += (rAF + rBF) / 2
+    return c / batch
+
+
+def agm_self(ir: torch.Tensor, vis: torch.Tensor,
+             fused: torch.Tensor, i2: torch.Tensor):
+    """
+    自适应自引导模块（纯自引导版本）。
+
+    比较 fused 与 I2（模型历史最佳输出）的质量，
+    返回引导目标、自适应权重和是否需要更新 I2 的标记。
+    """
+    with torch.no_grad():
+        fused_d = Variable(fused.data.clone(), requires_grad=False)
+        i2_d = Variable(i2.data.clone(), requires_grad=False)
+        ir_d = Variable(ir.data.clone(), requires_grad=False)
+        vis_d = Variable(vis.data.clone(), requires_grad=False)
+
+        w1 = cc(ir_d, vis_d, fused_d)
+        w3 = cc(ir_d, vis_d, i2_d)
+
+        if torch.isnan(w3):
+            w3 = torch.tensor(0.0)
+        if w1 < 0 or w3 <= 0:
+            w1 = w1 + 1
+            w3 = w3 + 1
+
+        w = 3 * w3 / (w1 + 1e-8)
+        flag = w1 >= w3
+
+    return i2, w.item(), flag
+
+
+def save_choose_best(fused: torch.Tensor, i2_dir: str,
+                     img_names: list, epoch: int, flag: bool):
+    """
+    保存模型输出到 I2 目录。
+    epoch==0 时无条件保存（初始化 I2）；之后仅在 fused 更优时保存。
+    """
+    if epoch == 0 or flag:
+        fused_np = fused.cpu().detach().numpy()
+        for j, name in enumerate(img_names):
+            img = (fused_np[j, 0, :, :] * 255).clip(0, 255).astype(np.uint8)
+            stem = Path(name).stem
+            out_path = os.path.join(i2_dir, f"{stem}.jpg")
+            cv2.imwrite(out_path, img)
+
+
+# ── 训练 / 验证函数 ──────────────────────────────────────────
+
+def train_one_epoch(model, loader, optimizer, device, writer, epoch, opts,
+                    vgg_loss=None):
     model.train()
     meter_total = AverageMeter('loss')
     meter_int = AverageMeter('int')
     meter_ssim = AverageMeter('ssim')
-    meter_grad = AverageMeter('grad')
+    meter_sf = AverageMeter('sf')
     meter_align = AverageMeter('align')
     meter_perceptual = AverageMeter('perc')
+    meter_guidance = AverageMeter('guid')
 
+    cnt_update = 0
     start = time.time()
-    for it, (ir, vis, _) in enumerate(loader):
+
+    for it, (ir, vis, i2, names) in enumerate(loader):
         ir = ir.to(device)
         vis = vis.to(device)
+        i2 = i2.to(device)
 
         fused, aligned_ir, offset = model(ir, vis)
 
-        # 注意：此处必须使用 aligned_ir 去算下游损失
-        # 因为用原图算会强制网络输出具有双影的错误融合结果！
+        # AGM: 计算引导权重（epoch 0 无引导）
+        gd_weight = 0.0
+        gd_img = None
+        flag = True
+        if opts.use_agm and epoch > 0:
+            gd_img, gd_weight, flag = agm_self(aligned_ir, vis, fused, i2)
+            if flag:
+                cnt_update += 1
+
         total_loss, detail = fusion_loss(
-            fused, aligned_ir, vis,  
+            fused, aligned_ir, vis,
             lambda_int=opts.lambda_int,
             lambda_ssim=opts.lambda_ssim,
-            lambda_grad=opts.lambda_grad,
+            lambda_sf=opts.lambda_sf,
             lambda_tv=10.0,
             offset=offset,
             vgg_loss=vgg_loss,
             lambda_perceptual=opts.lambda_perceptual,
             use_align=opts.use_align,
+            guidance_img=gd_img,
+            guidance_weight=gd_weight,
         )
 
         optimizer.zero_grad()
@@ -77,32 +161,37 @@ def train_one_epoch(model, loader, optimizer, device, writer, epoch, opts, vgg_l
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
+        # AGM: 保存更优结果到 I2
+        if opts.use_agm and opts.i2_dir:
+            save_choose_best(fused, opts.i2_dir, names, epoch, flag)
+
         meter_total.update(detail['total'])
         meter_int.update(detail['intensity'])
         meter_ssim.update(detail['ssim'])
-        meter_grad.update(detail['gradient'])
+        meter_sf.update(detail['sf'])
         meter_align.update(detail['align'])
         meter_perceptual.update(detail['perceptual'])
+        meter_guidance.update(detail['guidance'])
 
         global_step = epoch * len(loader) + it
         if it % opts.log_freq == 0:
             writer.add_scalar('train/loss', detail['total'], global_step)
-            writer.add_scalar('train/intensity', detail['intensity'], global_step)
-            writer.add_scalar('train/ssim', detail['ssim'], global_step)
-            writer.add_scalar('train/gradient', detail['gradient'], global_step)
-            writer.add_scalar('train/align', detail['align'], global_step)
-            writer.add_scalar('train/perceptual', detail['perceptual'], global_step)
+            writer.add_scalar('train/sf', detail['sf'], global_step)
+            writer.add_scalar('train/guidance', detail['guidance'], global_step)
             elapsed = time.time() - start
+            gd_str = f"Guid={detail['guidance']:.4f} w={gd_weight:.2f}" if opts.use_agm else ""
             print(
                 f"  Ep[{epoch}/{opts.epoch}] It[{it}/{len(loader)}] "
                 f"Loss={detail['total']:.4f} "
                 f"Int={detail['intensity']:.4f} "
                 f"SSIM={detail['ssim']:.4f} "
-                f"Grad={detail['gradient']:.4f} "
-                f"Align(NCC)={detail['align']:.4f} "
+                f"SF={detail['sf']:.4f} "
                 f"Perc={detail['perceptual']:.4f} "
-                f"[{elapsed:.1f}s]"
+                f"{gd_str} [{elapsed:.1f}s]"
             )
+
+    if opts.use_agm:
+        print(f"  AGM: {cnt_update}/{len(loader)} batches updated I2")
 
     return meter_total.avg
 
@@ -111,14 +200,14 @@ def validate(model, loader, device, opts, vgg_loss=None):
     model.eval()
     meter = AverageMeter('val_loss')
     with torch.no_grad():
-        for ir, vis, _ in loader:
+        for ir, vis, _, _ in loader:
             ir, vis = ir.to(device), vis.to(device)
             fused = model(ir, vis)
             total_loss, _ = fusion_loss(
                 fused, ir, vis,
                 lambda_int=opts.lambda_int,
                 lambda_ssim=opts.lambda_ssim,
-                lambda_grad=opts.lambda_grad,
+                lambda_sf=opts.lambda_sf,
                 lambda_tv=10.0,
                 offset=None,
                 vgg_loss=vgg_loss,
@@ -129,19 +218,32 @@ def validate(model, loader, device, opts, vgg_loss=None):
     return meter.avg
 
 
+# ── 主函数 ────────────────────────────────────────────────────
+
 def main(opts):
-    # 设备
     device = torch.device(f"cuda:{opts.gpu_id}" if torch.cuda.is_available() else "cpu")
     print(f"使用设备: {device}")
 
-    # 数据集（兼容 data/val 和 data/test 两种目录名）
+    # I2 目录初始化
+    if opts.use_agm:
+        i2_dir = opts.i2_dir
+        os.makedirs(i2_dir, exist_ok=True)
+        print(f"AGM 自引导已开启，I2 目录: {i2_dir}")
+
+    # 数据集
     val_split = 'val' if os.path.isdir(os.path.join(opts.data_path, 'val')) else 'test'
-    train_set = FusionDataset(os.path.join(opts.data_path, 'train'),
-                              patch_size=opts.patch_size, augment=True)
-    val_set = FusionDataset(os.path.join(opts.data_path, val_split),
-                            patch_size=opts.patch_size, augment=False)
+    train_set = FusionDataset(
+        os.path.join(opts.data_path, 'train'),
+        patch_size=opts.patch_size, augment=True,
+        i2_dir=opts.i2_dir if opts.use_agm else None,
+    )
+    val_set = FusionDataset(
+        os.path.join(opts.data_path, val_split),
+        patch_size=opts.patch_size, augment=False,
+    )
     train_loader = DataLoader(train_set, batch_size=opts.batch_size,
-                              shuffle=True, num_workers=opts.num_workers, pin_memory=True)
+                              shuffle=True, num_workers=opts.num_workers,
+                              pin_memory=True)
     val_loader = DataLoader(val_set, batch_size=opts.batch_size,
                             shuffle=False, num_workers=opts.num_workers)
 
@@ -155,18 +257,17 @@ def main(opts):
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"总参数量: {total_params:,} ({total_params / 1e3:.1f}K)")
 
-    # 优化器 + 学习率调度
     optimizer = Adam(model.parameters(), lr=opts.lr, weight_decay=1e-4)
     scheduler = CosineAnnealingLR(optimizer, T_max=opts.epoch, eta_min=opts.lr * 0.01)
 
-    # 日志
     log_dir = os.path.join(opts.log_dir, opts.name)
     os.makedirs(log_dir, exist_ok=True)
     writer = SummaryWriter(log_dir)
     logger = setup_logger(os.path.join(log_dir, 'train.log'))
     logger.info(f"模型参数量: {total_params:,}")
+    if opts.use_agm:
+        logger.info("AGM 自适应自引导已开启")
 
-    # 断点续训
     start_epoch = 0
     best_val_loss = float('inf')
     if opts.is_resume:
@@ -177,9 +278,10 @@ def main(opts):
 
     vgg_loss = VGGPerceptualLoss().to(device) if opts.lambda_perceptual > 0 else None
 
-    # 训练循环
     for epoch in range(start_epoch, opts.epoch):
-        train_loss = train_one_epoch(model, train_loader, optimizer, device, writer, epoch, opts, vgg_loss=vgg_loss)
+        train_loss = train_one_epoch(
+            model, train_loader, optimizer, device, writer, epoch, opts,
+            vgg_loss=vgg_loss)
         val_loss = validate(model, val_loader, device, opts, vgg_loss=vgg_loss)
         scheduler.step()
 
@@ -190,14 +292,12 @@ def main(opts):
         writer.add_scalar('val/loss', val_loss, epoch)
         writer.add_scalar('lr', lr_now, epoch)
 
-        # 保存最优模型
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_path = os.path.join(opts.model_path, 'best.pth')
             save_model(best_path, epoch, best_val_loss, model, optimizer)
             print(f"  [BEST] Saved model -> {best_path}  (val_loss={val_loss:.4f})")
 
-        # 每 10 epoch 保存 checkpoint
         if (epoch + 1) % 10 == 0:
             ckpt_path = os.path.join(opts.model_path, f'epoch_{epoch}.pth')
             save_model(ckpt_path, epoch, val_loss, model, optimizer)
@@ -225,17 +325,21 @@ def parse_opt():
     parser.add_argument('--lr', type=float, default=1e-3, help='初始学习率')
     parser.add_argument('--lambda_int', type=float, default=1.0, help='强度损失权重')
     parser.add_argument('--lambda_ssim', type=float, default=1.0, help='SSIM 损失权重')
-    parser.add_argument('--lambda_grad', type=float, default=0.5, help='梯度损失权重')
+    parser.add_argument('--lambda_sf', type=float, default=1.0, help='SF 纹理损失权重')
     parser.add_argument('--lambda_perceptual', type=float, default=1.0, help='感知损失权重')
     parser.add_argument('--gpu_id', type=int, default=0, help='GPU 编号')
     parser.add_argument('--is_resume', type=str, default=None, help='断点续训权重路径')
+
+    # AGM 自引导
+    parser.add_argument('--use_agm', action='store_true', help='开启 AGM 自适应自引导训练')
+    parser.add_argument('--i2_dir', type=str, default='./data_csmr/train/i2', help='I2 引导图像目录')
 
     # 输出
     parser.add_argument('--name', type=str, default='LMAFusion', help='实验名称')
     parser.add_argument('--model_path', type=str, default='./model', help='模型保存目录')
     parser.add_argument('--log_dir', type=str, default='./logs', help='TensorBoard 日志目录')
     parser.add_argument('--log_freq', type=int, default=20, help='打印频率（iteration）')
-    parser.add_argument('--use_align', action='store_true', help='开启DCN形变对齐（若数据集已严格对齐如MSRS请勿开启）')
+    parser.add_argument('--use_align', action='store_true', help='开启DCN形变对齐')
 
     return parser.parse_args()
 

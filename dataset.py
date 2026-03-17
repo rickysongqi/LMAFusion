@@ -36,6 +36,7 @@ class FusionDataset(Dataset):
         data_dir   (str ) : 数据根目录（含 ir/ 和 vis/ 子目录）
         patch_size (int ) : 随机裁剪 patch 大小（None = 不裁剪，用全图）
         augment    (bool) : 是否进行数据增强（翻转/亮度抖动）
+        i2_dir     (str ) : 自引导图像 I2 目录（AGM 自适应引导训练用）
     """
 
     def __init__(
@@ -43,21 +44,21 @@ class FusionDataset(Dataset):
         data_dir: str,
         patch_size: int = 128,
         augment: bool = True,
-        vis_crop: tuple = None,   # (x1, y1, x2, y2) VIS原图裁剪区域（None=不裁剪，直接resize）
+        vis_crop: tuple = None,
+        i2_dir: str = None,
     ):
         self.patch_size = patch_size
         self.augment = augment
-        self.vis_crop = vis_crop  # None 或 (x1, y1, x2, y2)
+        self.vis_crop = vis_crop
+        self.i2_dir = Path(i2_dir) if i2_dir else None
 
         ir_dir = Path(data_dir) / 'ir'
-        # 兼容 MSRS（vi）和 旧格式（vis）两种子目录名
         vis_dir = Path(data_dir) / 'vis'
         if not vis_dir.exists():
             vis_dir = Path(data_dir) / 'vi'
         if not vis_dir.exists():
             raise FileNotFoundError(f"在 {data_dir} 下未找到 vis/ 或 vi/ 子目录")
 
-        # 获取两个目录中共有图像的文件名（同名配对）
         ir_names = {f.name for f in ir_dir.glob('*.png')}
         ir_names |= {f.name for f in ir_dir.glob('*.jpg')}
         vis_names = {f.name for f in vis_dir.glob('*.png')}
@@ -72,6 +73,7 @@ class FusionDataset(Dataset):
 
         self.ir_paths = [str(ir_dir / name) for name in common_names]
         self.vis_paths = [str(vis_dir / name) for name in common_names]
+        self.names = common_names
         print(f"数据集 [{data_dir}] 加载成功：{len(self.ir_paths)} 对图像")
 
     def __len__(self) -> int:
@@ -116,40 +118,56 @@ class FusionDataset(Dataset):
             vis = np.clip(vis * factor, 0.0, 1.0)
         return ir, vis
 
+    def _load_i2(self, name: str, target_h: int, target_w: int) -> np.ndarray:
+        """加载 I2 引导图像；不存在则返回全白图（值 1.0）"""
+        if self.i2_dir is None:
+            return np.ones((target_h, target_w), dtype=np.float32)
+        # I2 统一存为 .jpg
+        stem = Path(name).stem
+        i2_path = self.i2_dir / f"{stem}.jpg"
+        if not i2_path.exists():
+            i2_path = self.i2_dir / name
+        if i2_path.exists():
+            try:
+                return self._load_gray(str(i2_path))
+            except IOError:
+                pass
+        return np.ones((target_h, target_w), dtype=np.float32)
+
     def __getitem__(self, idx: int) -> tuple:
         ir = self._load_gray(self.ir_paths[idx])
         vis = self._load_gray(self.vis_paths[idx])
+        name = os.path.basename(self.ir_paths[idx])
 
-        # 统一尺寸：将 VIS 对齐到 IR 的视场后，再缩放到同一分辨率
-        # 步骤1（可选）：先裁剪 VIS，去掉 FOV 不对应的多余区域
         if self.vis_crop is not None:
             x1, y1, x2, y2 = self.vis_crop
             vis = vis[y1:y2, x1:x2]
-        # 步骤2：再 resize 到与 IR 相同尺寸（此时两图已经近似对应同一 FOV）
         ir_h, ir_w = ir.shape[:2]
         vis_h, vis_w = vis.shape[:2]
         if (vis_h, vis_w) != (ir_h, ir_w):
             vis = cv2.resize(vis, (ir_w, ir_h), interpolation=cv2.INTER_LINEAR)
 
-        # 随机裁剪
+        i2 = self._load_i2(name, ir_h, ir_w)
+        if i2.shape[:2] != (ir_h, ir_w):
+            i2 = cv2.resize(i2, (ir_w, ir_h), interpolation=cv2.INTER_LINEAR)
+
         if self.patch_size is not None:
             h, w = ir.shape[:2]
             if h >= self.patch_size and w >= self.patch_size:
-                ir, vis = self._random_crop(ir, vis)
+                ir, vis, i2 = self._random_crop(ir, vis, i2)
             else:
-                # 图像不够大时先 resize
                 ir = cv2.resize(ir, (self.patch_size, self.patch_size))
                 vis = cv2.resize(vis, (self.patch_size, self.patch_size))
+                i2 = cv2.resize(i2, (self.patch_size, self.patch_size))
 
-        # 数据增强
         if self.augment:
             ir, vis = self._augment(ir, vis)
 
-        # 转为 Tensor [1, H, W]
         ir_t = torch.from_numpy(np.ascontiguousarray(ir)).unsqueeze(0)
         vis_t = torch.from_numpy(np.ascontiguousarray(vis)).unsqueeze(0)
+        i2_t = torch.from_numpy(np.ascontiguousarray(i2)).unsqueeze(0)
 
-        return ir_t, vis_t, os.path.basename(self.ir_paths[idx])
+        return ir_t, vis_t, i2_t, name
 
 
 class DroneDatasetPreparer:
