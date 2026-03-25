@@ -87,6 +87,33 @@ def intensity_loss(fused: torch.Tensor,
 
 
 # ──────────────────────────────────────────────────────────────
+# 1b. 红外显著性增强损失 (IR Saliency Loss)
+# ──────────────────────────────────────────────────────────────
+def ir_saliency_loss(fused: torch.Tensor,
+                     ir: torch.Tensor,
+                     vis: torch.Tensor,
+                     threshold: float = 0.15,
+                     k: float = 30.0) -> torch.Tensor:
+    """
+    红外显著性增强损失：对 IR 明显亮于 VIS 的区域（如无人机热信号），
+    强制融合图保留 IR 的亮度。
+
+    使用 sigmoid 软掩膜自动检测 IR 显著区域：
+      - IR >> VIS 的像素 → 高权重，强制 fused ≈ IR
+      - IR ≤ VIS 的像素 → 低权重，不干预
+
+    参数:
+        threshold: IR-VIS 差值阈值，超过此值开始增强
+        k: sigmoid 陡度，越大边界越锐利
+    """
+    diff = ir - vis
+    mask = torch.sigmoid(k * (diff - threshold))
+    error = torch.abs(fused - ir)
+    loss = (mask * error).sum() / (mask.sum() + 1e-8)
+    return loss
+
+
+# ──────────────────────────────────────────────────────────────
 # 2. 结构相似性损失（SSIM-based）
 # ──────────────────────────────────────────────────────────────
 def gaussian_kernel(window_size: int = 11, sigma: float = 1.5) -> torch.Tensor:
@@ -279,6 +306,7 @@ def fusion_loss(
     lambda_int: float = 1.0,
     lambda_ssim: float = 1.0,
     lambda_sf: float = 1.0,
+    lambda_ir_sal: float = 0.0,
     lambda_tv: float = 0.0,
     offset: torch.Tensor = None,
     lambda_align: float = 5.0,
@@ -291,8 +319,7 @@ def fusion_loss(
     """
     复合融合损失函数。
 
-    内容损失 = 强度 + SSIM + SF（替代 Sobel 梯度） + 感知 + 对齐 + TV
-    引导损失 = guidance_weight * (SSIM + SF)(fused, guidance_img)
+    内容损失 = 强度 + SSIM + SF + IR显著性 + 感知 + 对齐 + TV
     """
     # 1. 强度损失
     L_int = intensity_loss(fused, aligned_ir, vis)
@@ -308,6 +335,12 @@ def fusion_loss(
     L_sf = L_sf_ir + L_sf_vis
 
     total = lambda_int * L_int + lambda_ssim * L_ssim + lambda_sf * L_sf
+
+    # 3b. 红外显著性增强损失
+    L_ir_sal = torch.tensor(0.0, device=fused.device)
+    if lambda_ir_sal > 0:
+        L_ir_sal = ir_saliency_loss(fused, aligned_ir, vis)
+        total = total + lambda_ir_sal * L_ir_sal
 
     # 4. 对齐损失
     L_align = torch.tensor(0.0, device=fused.device)
@@ -338,6 +371,7 @@ def fusion_loss(
         'intensity': L_int.item(),
         'ssim': L_ssim.item(),
         'sf': L_sf.item(),
+        'ir_sal': L_ir_sal.item(),
         'align': L_align.item(),
         'perceptual': L_perceptual.item(),
         'tv': L_tv.item(),

@@ -102,20 +102,27 @@ class FusionDataset(Dataset):
         x0 = random.randint(0, max_x)
         return [img[y0:y0 + self.patch_size, x0:x0 + self.patch_size] for img in images]
 
-    def _augment(self, ir: np.ndarray, vis: np.ndarray) -> tuple:
+    def _augment(self, ir: np.ndarray, vis: np.ndarray,
+                 i2: np.ndarray = None) -> tuple:
         """数据增强：随机水平/垂直翻转，可见光亮度抖动"""
         # 随机水平翻转
         if random.random() > 0.5:
             ir = np.fliplr(ir)
             vis = np.fliplr(vis)
+            if i2 is not None:
+                i2 = np.fliplr(i2)
         # 随机垂直翻转
         if random.random() > 0.3:
             ir = np.flipud(ir)
             vis = np.flipud(vis)
+            if i2 is not None:
+                i2 = np.flipud(i2)
         # 可见光亮度随机扰动（+- 10%）
         if random.random() > 0.5:
             factor = random.uniform(0.9, 1.1)
             vis = np.clip(vis * factor, 0.0, 1.0)
+        if i2 is not None:
+            return ir, vis, i2
         return ir, vis
 
     def _load_i2(self, name: str, target_h: int, target_w: int) -> np.ndarray:
@@ -161,7 +168,7 @@ class FusionDataset(Dataset):
                 i2 = cv2.resize(i2, (self.patch_size, self.patch_size))
 
         if self.augment:
-            ir, vis = self._augment(ir, vis)
+            ir, vis, i2 = self._augment(ir, vis, i2)
 
         ir_t = torch.from_numpy(np.ascontiguousarray(ir)).unsqueeze(0)
         vis_t = torch.from_numpy(np.ascontiguousarray(vis)).unsqueeze(0)

@@ -95,19 +95,76 @@ def agm_self(ir: torch.Tensor, vis: torch.Tensor,
     return i2, w.item(), flag
 
 
-def save_choose_best(fused: torch.Tensor, i2_dir: str,
-                     img_names: list, epoch: int, flag: bool):
+def update_i2_fullres(model, data_dir: str, device, i2_dir: str, epoch: int):
     """
-    保存模型输出到 I2 目录。
-    epoch==0 时无条件保存（初始化 I2）；之后仅在 fused 更优时保存。
+    每个 epoch 结束后，用全分辨率图像跑一遍模型，更新 I2。
+    epoch==0 无条件保存；之后仅在 fused 质量超过已有 I2 时更新。
     """
-    if epoch == 0 or flag:
-        fused_np = fused.cpu().detach().numpy()
-        for j, name in enumerate(img_names):
-            img = (fused_np[j, 0, :, :] * 255).clip(0, 255).astype(np.uint8)
-            stem = Path(name).stem
-            out_path = os.path.join(i2_dir, f"{stem}.jpg")
-            cv2.imwrite(out_path, img)
+    model.eval()
+    ir_dir = Path(data_dir) / 'ir'
+    vis_dir = Path(data_dir) / 'vis'
+    if not vis_dir.exists():
+        vis_dir = Path(data_dir) / 'vi'
+
+    ir_files = sorted(list(ir_dir.glob('*.jpg')) + list(ir_dir.glob('*.png')))
+    cnt_update = 0
+
+    with torch.no_grad():
+        for ir_path in ir_files:
+            name = ir_path.name
+            vis_path = vis_dir / name
+            if not vis_path.exists():
+                continue
+
+            ir_buf = np.fromfile(str(ir_path), dtype=np.uint8)
+            ir_img = cv2.imdecode(ir_buf, cv2.IMREAD_GRAYSCALE)
+            if ir_img is None:
+                continue
+            ir_img = ir_img.astype(np.float32) / 255.0
+
+            vis_buf = np.fromfile(str(vis_path), dtype=np.uint8)
+            vis_img = cv2.imdecode(vis_buf, cv2.IMREAD_GRAYSCALE)
+            if vis_img is None:
+                continue
+            vis_img = vis_img.astype(np.float32) / 255.0
+
+            h, w = ir_img.shape[:2]
+            vh, vw = vis_img.shape[:2]
+            if (vh, vw) != (h, w):
+                vis_img = cv2.resize(vis_img, (w, h))
+
+            ir_t = torch.from_numpy(ir_img).unsqueeze(0).unsqueeze(0).to(device)
+            vis_t = torch.from_numpy(vis_img).unsqueeze(0).unsqueeze(0).to(device)
+
+            fused = model(ir_t, vis_t)
+
+            stem = ir_path.stem
+            i2_path = Path(i2_dir) / f"{stem}.jpg"
+
+            should_save = (epoch == 0)
+            if not should_save and i2_path.exists():
+                i2_buf = np.fromfile(str(i2_path), dtype=np.uint8)
+                i2_img = cv2.imdecode(i2_buf, cv2.IMREAD_GRAYSCALE)
+                if i2_img is not None:
+                    i2_img = i2_img.astype(np.float32) / 255.0
+                    if i2_img.shape[:2] != (h, w):
+                        i2_img = cv2.resize(i2_img, (w, h))
+                    i2_t = torch.from_numpy(i2_img).unsqueeze(0).unsqueeze(0).to(device)
+                    w_new = cc(ir_t, vis_t, fused)
+                    w_old = cc(ir_t, vis_t, i2_t)
+                    should_save = (w_new >= w_old)
+                else:
+                    should_save = True
+            elif not should_save:
+                should_save = True
+
+            if should_save:
+                fused_np = (fused[0, 0].cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+                cv2.imwrite(str(i2_path), fused_np)
+                cnt_update += 1
+
+    print(f"  I2 全分辨率更新: {cnt_update}/{len(ir_files)} 张")
+    model.train()
 
 
 # ── 训练 / 验证函数 ──────────────────────────────────────────
@@ -147,6 +204,7 @@ def train_one_epoch(model, loader, optimizer, device, writer, epoch, opts,
             lambda_int=opts.lambda_int,
             lambda_ssim=opts.lambda_ssim,
             lambda_sf=opts.lambda_sf,
+            lambda_ir_sal=opts.lambda_ir_sal,
             lambda_tv=10.0,
             offset=offset,
             vgg_loss=vgg_loss,
@@ -160,10 +218,6 @@ def train_one_epoch(model, loader, optimizer, device, writer, epoch, opts,
         total_loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
-
-        # AGM: 保存更优结果到 I2
-        if opts.use_agm and opts.i2_dir:
-            save_choose_best(fused, opts.i2_dir, names, epoch, flag)
 
         meter_total.update(detail['total'])
         meter_int.update(detail['intensity'])
@@ -208,6 +262,7 @@ def validate(model, loader, device, opts, vgg_loss=None):
                 lambda_int=opts.lambda_int,
                 lambda_ssim=opts.lambda_ssim,
                 lambda_sf=opts.lambda_sf,
+                lambda_ir_sal=opts.lambda_ir_sal,
                 lambda_tv=10.0,
                 offset=None,
                 vgg_loss=vgg_loss,
@@ -278,10 +333,16 @@ def main(opts):
 
     vgg_loss = VGGPerceptualLoss().to(device) if opts.lambda_perceptual > 0 else None
 
+    train_data_dir = os.path.join(opts.data_path, 'train')
+
     for epoch in range(start_epoch, opts.epoch):
         train_loss = train_one_epoch(
             model, train_loader, optimizer, device, writer, epoch, opts,
             vgg_loss=vgg_loss)
+
+        if opts.use_agm and opts.i2_dir:
+            update_i2_fullres(model, train_data_dir, device, opts.i2_dir, epoch)
+
         val_loss = validate(model, val_loader, device, opts, vgg_loss=vgg_loss)
         scheduler.step()
 
@@ -327,6 +388,7 @@ def parse_opt():
     parser.add_argument('--lambda_ssim', type=float, default=1.0, help='SSIM 损失权重')
     parser.add_argument('--lambda_sf', type=float, default=1.0, help='SF 纹理损失权重')
     parser.add_argument('--lambda_perceptual', type=float, default=1.0, help='感知损失权重')
+    parser.add_argument('--lambda_ir_sal', type=float, default=0.0, help='红外显著性增强损失权重')
     parser.add_argument('--gpu_id', type=int, default=0, help='GPU 编号')
     parser.add_argument('--is_resume', type=str, default=None, help='断点续训权重路径')
 
