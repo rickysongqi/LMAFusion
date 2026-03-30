@@ -2,13 +2,15 @@
 图像质量指标评估脚本（不依赖 cv2 / skimage，使用纯 PyTorch + torchvision）
 
 指标:
-  PSNR  - 峰值信噪比（越高越好，对比VIS）
-  SSIM  - 结构相似度（越高越好，对比VIS）
+  PSNR  - 峰值信噪比（越高越好，对比 IR / VIS）
+  SSIM  - 结构相似度（越高越好，对比 IR / VIS）
   EN    - 信息熵（越高越好，衡量信息量）
   MI_ir - 融合图与IR的互信息（越高越好）
   MI_vis- 融合图与VIS的互信息（越高越好）
   SF    - 空间频率（越高越好，细节丰富度）
   AG    - 平均梯度（越高越好，图像清晰度）
+  Qabf  - 基于梯度的融合质量（越高越好，0~1）
+  Nabf  - 融合伪影度量（越低越好，≥0）
 
 用法:
   python evaluate.py --fused_dir ./results --ir_dir ./data/val/ir --vis_dir ./data/val/vis
@@ -23,6 +25,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torchvision.io as tio
+
+from ivif_metrics import compute_qabf, compute_nabf
 
 
 # ── 图像读取 ──────────────────────────────────────────────────
@@ -144,6 +148,8 @@ def evaluate(fused_dir, ir_dir, vis_dir):
             'MI_vis':   compute_mi(fused, vis),
             'SF':       compute_sf(fused),
             'AG':       compute_ag(fused),
+            'Qabf':     compute_qabf(ir, vis, fused),
+            'Nabf':     compute_nabf(ir, vis, fused),
         })
 
     if not results:
